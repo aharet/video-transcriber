@@ -59,18 +59,37 @@ def transcribe_youtube(url):
 
 def transcribe_with_whisper(url, model_size):
     import tempfile, yt_dlp, whisper
+    platform = detect_platform(url)
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        ydl_opts = {
+        base_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(tmpdir, "audio.%(ext)s"),
             "postprocessors": [{"key": "FFmpegExtractAudio",
                                 "preferredcodec": "mp3",
                                 "preferredquality": "192"}],
             "quiet": True, "no_warnings": True,
-            # use Chrome cookies so TikTok/Instagram don't block the download
-            "cookiesfrombrowser": ("chrome",),
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+        # TikTok needs specific API host + browser cookies to bypass bot detection
+        if platform == "tiktok":
+            base_opts.update({
+                "cookiesfrombrowser": ("chrome",),
+                "extractor_args": {
+                    "tiktok": {
+                        "api_hostname": ["api22-normal-c-useast2a.tiktokv.com"],
+                    }
+                },
+                "http_headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+                    ),
+                    "Referer": "https://www.tiktok.com/",
+                },
+            })
+
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
             ydl.download([url])
 
         audio_path = next(
