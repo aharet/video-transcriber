@@ -67,6 +67,8 @@ def transcribe_with_whisper(url, model_size):
                                 "preferredcodec": "mp3",
                                 "preferredquality": "192"}],
             "quiet": True, "no_warnings": True,
+            # use Chrome cookies so TikTok/Instagram don't block the download
+            "cookiesfrombrowser": ("chrome",),
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
