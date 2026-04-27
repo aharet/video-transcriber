@@ -1,7 +1,7 @@
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, filedialog
-import threading
 import os
+import re
+import threading
+import webbrowser
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -12,31 +12,26 @@ try:
 except ImportError:
     pass
 
+from flask import Flask, request, jsonify, Response
+
+app = Flask(__name__)
 
 # ── platform detection ────────────────────────────────────────────────────────
 
-def detect_platform(url: str) -> str:
-    url = url.lower()
-    if "youtube.com" in url or "youtu.be" in url:
+def detect_platform(url):
+    u = url.lower()
+    if "youtube.com" in u or "youtu.be" in u:
         return "youtube"
-    if "tiktok.com" in url:
-        return "tiktok"
-    if "instagram.com" in url:
-        return "instagram"
-    if "twitter.com" in url or "x.com" in url:
-        return "twitter/x"
-    if "facebook.com" in url or "fb.watch" in url:
-        return "facebook"
+    if "tiktok.com" in u:   return "tiktok"
+    if "instagram.com" in u: return "instagram"
+    if "twitter.com" in u or "x.com" in u: return "twitter/x"
+    if "facebook.com" in u or "fb.watch" in u: return "facebook"
     return "video"
 
+# ── transcription ─────────────────────────────────────────────────────────────
 
-# ── transcription logic ───────────────────────────────────────────────────────
-
-def transcribe_youtube(url: str) -> str:
-    """Uses YouTube's own captions — instant and free."""
-    import re
+def transcribe_youtube(url):
     from youtube_transcript_api import YouTubeTranscriptApi
-
     patterns = [
         r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})",
         r"(?:embed/)([A-Za-z0-9_-]{11})",
@@ -49,62 +44,46 @@ def transcribe_youtube(url: str) -> str:
             video_id = m.group(1)
             break
     if not video_id:
-        raise ValueError("Could not extract YouTube video ID from the URL.")
+        raise ValueError("Could not extract YouTube video ID from URL.")
 
-    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    tlist = YouTubeTranscriptApi.list_transcripts(video_id)
     try:
-        t = transcript_list.find_manually_created_transcript(["en", "en-US", "en-GB"])
+        t = tlist.find_manually_created_transcript(["en", "en-US", "en-GB"])
     except Exception:
         try:
-            t = transcript_list.find_generated_transcript(["en", "en-US", "en-GB"])
+            t = tlist.find_generated_transcript(["en", "en-US", "en-GB"])
         except Exception:
-            t = next(iter(transcript_list))
-
-    entries = t.fetch()
-    return " ".join(e["text"] for e in entries)
+            t = next(iter(tlist))
+    return " ".join(e["text"] for e in t.fetch())
 
 
-def transcribe_with_whisper(url: str, model_size: str, status_cb) -> str:
-    """Downloads audio with yt-dlp and transcribes locally with Whisper."""
-    import tempfile
-    import yt_dlp
-    import whisper
-
+def transcribe_with_whisper(url, model_size):
+    import tempfile, yt_dlp, whisper
     with tempfile.TemporaryDirectory() as tmpdir:
-        status_cb("Downloading audio…")
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(tmpdir, "audio.%(ext)s"),
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-            "quiet": True,
-            "no_warnings": True,
+            "postprocessors": [{"key": "FFmpegExtractAudio",
+                                "preferredcodec": "mp3",
+                                "preferredquality": "192"}],
+            "quiet": True, "no_warnings": True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        audio_path = None
-        for f in os.listdir(tmpdir):
-            if f.endswith(".mp3"):
-                audio_path = os.path.join(tmpdir, f)
-                break
+        audio_path = next(
+            (os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.endswith(".mp3")),
+            None
+        )
         if not audio_path:
-            raise FileNotFoundError("Audio download failed — no mp3 found.")
+            raise FileNotFoundError("Audio download failed.")
 
-        status_cb(f"Loading Whisper '{model_size}' model…")
         model = whisper.load_model(model_size)
-
-        status_cb("Transcribing… (this can take a minute)")
         result = model.transcribe(audio_path)
-
     return result["text"]
 
 
-def format_transcript(text: str) -> str:
-    import re
+def format_transcript(text):
     text = re.sub(r"\s+", " ", text).strip()
     sentences = re.split(r"(?<=[.!?])\s+", text)
     paragraphs, chunk = [], []
@@ -117,171 +96,196 @@ def format_transcript(text: str) -> str:
         paragraphs.append(" ".join(chunk))
     return "\n\n".join(paragraphs)
 
+# ── routes ────────────────────────────────────────────────────────────────────
 
-# ── background worker ─────────────────────────────────────────────────────────
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Transcriber</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       background:#f5f5f7;min-height:100vh;display:flex;justify-content:center;
+       padding:40px 16px}
+  .card{background:#fff;border-radius:16px;padding:36px;width:100%;max-width:700px;
+        box-shadow:0 2px 20px rgba(0,0,0,.08);align-self:flex-start}
+  h1{font-size:1.6rem;font-weight:700;margin-bottom:4px}
+  .sub{color:#666;font-size:.9rem;margin-bottom:28px}
+  label{display:block;font-weight:600;font-size:.85rem;margin-bottom:6px;color:#333}
+  input[type=text]{width:100%;padding:10px 14px;border:1.5px solid #ddd;border-radius:8px;
+                   font-size:1rem;outline:none;transition:border .2s}
+  input[type=text]:focus{border-color:#2563eb}
+  select{padding:8px 12px;border:1.5px solid #ddd;border-radius:8px;font-size:.9rem;
+         background:#fff;outline:none;cursor:pointer}
+  .row{display:flex;gap:16px;align-items:flex-end;margin:16px 0 20px}
+  .row>div{flex:1}
+  button.primary{background:#2563eb;color:#fff;border:none;padding:11px 28px;
+                 border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;
+                 transition:background .2s;width:100%}
+  button.primary:hover{background:#1d4ed8}
+  button.primary:disabled{background:#93c5fd;cursor:not-allowed}
+  #status{margin:16px 0 4px;font-size:.9rem;color:#555;min-height:20px}
+  #status.error{color:#dc2626}
+  #status.ok{color:#16a34a}
+  textarea{width:100%;min-height:320px;border:1.5px solid #ddd;border-radius:8px;
+           padding:14px;font-size:.95rem;line-height:1.6;resize:vertical;
+           font-family:inherit;outline:none;margin-top:8px}
+  .actions{display:flex;gap:10px;margin-top:12px}
+  .actions button{flex:1;padding:9px;border:1.5px solid #ddd;border-radius:8px;
+                  background:#fff;font-size:.9rem;cursor:pointer;font-weight:500;
+                  transition:background .15s}
+  .actions button:hover{background:#f3f4f6}
+  .meta{font-size:.8rem;color:#999;margin-top:8px;text-align:right}
+  .hint{font-size:.8rem;color:#999;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎬 Video Transcriber</h1>
+  <p class="sub">YouTube · TikTok · Instagram · Twitter/X · Facebook</p>
 
-def run_transcription(url, model_size, status_cb, done_cb, error_cb):
+  <label for="url">Video URL</label>
+  <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=...">
+
+  <div class="row">
+    <div>
+      <label for="model">Whisper model <span style="font-weight:400;color:#999">(non-YouTube only)</span></label>
+      <select id="model">
+        <option value="tiny">tiny — fastest</option>
+        <option value="base" selected>base — balanced ✓</option>
+        <option value="small">small — more accurate</option>
+        <option value="medium">medium — most accurate</option>
+      </select>
+    </div>
+    <div>
+      <button class="primary" id="btn" onclick="transcribe()">Transcribe</button>
+    </div>
+  </div>
+
+  <p id="status"></p>
+
+  <label>Transcript</label>
+  <textarea id="output" placeholder="Your transcript will appear here…" readonly></textarea>
+  <p class="meta" id="meta"></p>
+
+  <div class="actions">
+    <button onclick="copyText()">📋 Copy</button>
+    <button onclick="downloadText()">💾 Save as .txt</button>
+    <button onclick="clearAll()">✕ Clear</button>
+  </div>
+</div>
+
+<script>
+async function transcribe() {
+  const url = document.getElementById('url').value.trim();
+  if (!url) { setStatus('Please paste a video URL first.', 'error'); return; }
+
+  const btn = document.getElementById('btn');
+  btn.disabled = true;
+  document.getElementById('output').value = '';
+  document.getElementById('meta').textContent = '';
+  setStatus('Starting…', '');
+
+  try {
+    const res = await fetch('/transcribe', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url, model: document.getElementById('model').value})
+    });
+    const data = await res.json();
+    if (data.error) {
+      setStatus('Error: ' + data.error, 'error');
+    } else {
+      document.getElementById('output').value = data.transcript;
+      const words = data.transcript.split(/\s+/).length;
+      document.getElementById('meta').textContent =
+        words.toLocaleString() + ' words · ' + data.transcript.length.toLocaleString() + ' characters';
+      setStatus('Done! ✓', 'ok');
+    }
+  } catch(e) {
+    setStatus('Request failed: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+}
+
+function setStatus(msg, cls) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = cls;
+}
+
+function copyText() {
+  const t = document.getElementById('output').value;
+  if (!t) return;
+  navigator.clipboard.writeText(t);
+  setStatus('Copied to clipboard!', 'ok');
+}
+
+function downloadText() {
+  const t = document.getElementById('output').value;
+  if (!t) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([t], {type:'text/plain'}));
+  a.download = 'transcript.txt';
+  a.click();
+}
+
+function clearAll() {
+  document.getElementById('url').value = '';
+  document.getElementById('output').value = '';
+  document.getElementById('meta').textContent = '';
+  setStatus('', '');
+}
+
+// allow Enter key to trigger transcription
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && document.activeElement.id === 'url') transcribe();
+});
+</script>
+</body>
+</html>"""
+
+
+@app.route("/")
+def index():
+    return HTML
+
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe():
+    data = request.get_json()
+    url = (data.get("url") or "").strip()
+    model_size = data.get("model", "base")
+
+    if not url:
+        return jsonify({"error": "No URL provided."})
+
     try:
         platform = detect_platform(url)
-        status_cb(f"Platform: {platform.upper()} — starting…")
-
         if platform == "youtube":
-            status_cb("Fetching YouTube captions…")
             try:
                 raw = transcribe_youtube(url)
-                status_cb("YouTube captions found — done!")
             except Exception:
-                status_cb("No captions found — falling back to Whisper…")
-                raw = transcribe_with_whisper(url, model_size, status_cb)
+                raw = transcribe_with_whisper(url, model_size)
         else:
-            raw = transcribe_with_whisper(url, model_size, status_cb)
+            raw = transcribe_with_whisper(url, model_size)
 
         transcript = format_transcript(raw)
-        done_cb(transcript)
+        return jsonify({"transcript": transcript})
 
     except Exception as e:
-        error_cb(str(e))
+        return jsonify({"error": str(e)})
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
-
-class TranscriberApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Video Transcriber")
-        self.geometry("680x560")
-        self.resizable(True, True)
-        self.configure(bg="#f0f0f0", padx=24, pady=20)
-        self._build_ui()
-
-    def _build_ui(self):
-        # title
-        tk.Label(self, text="🎬 Video Transcriber", font=("Arial", 18, "bold"),
-                 bg="#f0f0f0").pack(anchor="w", pady=(0, 4))
-        tk.Label(self, text="YouTube • TikTok • Instagram • Twitter/X • Facebook",
-                 font=("Arial", 10), fg="#666", bg="#f0f0f0").pack(anchor="w", pady=(0, 16))
-
-        # url input
-        tk.Label(self, text="Video URL", font=("Arial", 11, "bold"),
-                 bg="#f0f0f0").pack(anchor="w")
-        url_frame = tk.Frame(self, bg="#f0f0f0")
-        url_frame.pack(fill="x", pady=(4, 12))
-        self.url_var = tk.StringVar()
-        self.url_entry = tk.Entry(url_frame, textvariable=self.url_var,
-                                  font=("Arial", 12), relief="solid", bd=1)
-        self.url_entry.pack(side="left", fill="x", expand=True, ipady=6)
-        tk.Button(url_frame, text="✕", font=("Arial", 10), relief="flat",
-                  bg="#f0f0f0", command=lambda: self.url_var.set("")).pack(side="left", padx=(6, 0))
-
-        # model selector
-        model_frame = tk.Frame(self, bg="#f0f0f0")
-        model_frame.pack(fill="x", pady=(0, 12))
-        tk.Label(model_frame, text="Whisper model (for non-YouTube):",
-                 font=("Arial", 10), bg="#f0f0f0").pack(side="left")
-        self.model_var = tk.StringVar(value="base")
-        model_menu = ttk.Combobox(model_frame, textvariable=self.model_var,
-                                   values=["tiny", "base", "small", "medium"],
-                                   state="readonly", width=10)
-        model_menu.pack(side="left", padx=(8, 0))
-        tk.Label(model_frame,
-                 text="  tiny=fastest  base=balanced  small/medium=most accurate",
-                 font=("Arial", 9), fg="#888", bg="#f0f0f0").pack(side="left")
-
-        # transcribe button
-        self.btn = tk.Button(self, text="Transcribe", font=("Arial", 13, "bold"),
-                             bg="#2563eb", fg="white", relief="flat",
-                             activebackground="#1d4ed8", activeforeground="white",
-                             padx=24, pady=8, cursor="hand2",
-                             command=self._start)
-        self.btn.pack(pady=(0, 10))
-
-        # status
-        self.status_var = tk.StringVar(value="Ready.")
-        tk.Label(self, textvariable=self.status_var, font=("Arial", 10, "italic"),
-                 fg="#555", bg="#f0f0f0").pack(anchor="w", pady=(0, 8))
-
-        # output
-        tk.Label(self, text="Transcript", font=("Arial", 11, "bold"),
-                 bg="#f0f0f0").pack(anchor="w")
-        self.text_area = scrolledtext.ScrolledText(
-            self, wrap=tk.WORD, font=("Arial", 11),
-            relief="solid", bd=1, height=14)
-        self.text_area.pack(fill="both", expand=True, pady=(4, 10))
-
-        # action buttons
-        btn_frame = tk.Frame(self, bg="#f0f0f0")
-        btn_frame.pack(fill="x")
-        tk.Button(btn_frame, text="📋 Copy", font=("Arial", 10),
-                  command=self._copy, relief="solid", bd=1,
-                  padx=12, pady=4).pack(side="left", padx=(0, 8))
-        tk.Button(btn_frame, text="💾 Save as .txt", font=("Arial", 10),
-                  command=self._save, relief="solid", bd=1,
-                  padx=12, pady=4).pack(side="left")
-        self.word_count_var = tk.StringVar(value="")
-        tk.Label(btn_frame, textvariable=self.word_count_var, font=("Arial", 9),
-                 fg="#888", bg="#f0f0f0").pack(side="right")
-
-    def _start(self):
-        url = self.url_var.get().strip()
-        if not url:
-            messagebox.showwarning("Missing URL", "Please paste a video URL first.")
-            return
-        self.btn.config(state="disabled")
-        self.text_area.delete("1.0", tk.END)
-        self.word_count_var.set("")
-        t = threading.Thread(
-            target=run_transcription,
-            args=(url, self.model_var.get(),
-                  self._set_status, self._on_done, self._on_error),
-            daemon=True,
-        )
-        t.start()
-
-    def _set_status(self, msg):
-        self.after(0, lambda: self.status_var.set(msg))
-
-    def _on_done(self, transcript):
-        def _update():
-            self.text_area.delete("1.0", tk.END)
-            self.text_area.insert(tk.END, transcript)
-            words = len(transcript.split())
-            self.word_count_var.set(f"{words:,} words · {len(transcript):,} chars")
-            self.status_var.set("Done!")
-            self.btn.config(state="normal")
-        self.after(0, _update)
-
-    def _on_error(self, msg):
-        def _update():
-            self.status_var.set("Error — see message box.")
-            messagebox.showerror("Transcription Error", msg)
-            self.btn.config(state="normal")
-        self.after(0, _update)
-
-    def _copy(self):
-        text = self.text_area.get("1.0", tk.END).strip()
-        if text:
-            self.clipboard_clear()
-            self.clipboard_append(text)
-            self.status_var.set("Copied to clipboard!")
-        else:
-            messagebox.showinfo("Nothing to copy", "Run a transcription first.")
-
-    def _save(self):
-        text = self.text_area.get("1.0", tk.END).strip()
-        if not text:
-            messagebox.showinfo("Nothing to save", "Run a transcription first.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialfile="transcript.txt",
-        )
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
-            self.status_var.set(f"Saved to {os.path.basename(path)}")
-
+# ── launch ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app = TranscriberApp()
-    app.mainloop()
+    port = 5123
+    url = f"http://localhost:{port}"
+    # open browser after a short delay so Flask has time to start
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    print(f"\n  Video Transcriber running at {url}")
+    print("  Press Ctrl+C to stop.\n")
+    app.run(port=port, debug=False)
