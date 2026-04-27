@@ -5,6 +5,13 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
+# make static-ffmpeg available if system ffmpeg is missing
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except ImportError:
+    pass
+
 
 # ── platform detection ────────────────────────────────────────────────────────
 
