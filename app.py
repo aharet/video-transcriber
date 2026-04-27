@@ -69,12 +69,12 @@ def transcribe_with_whisper(url, model_size):
                                 "preferredcodec": "mp3",
                                 "preferredquality": "192"}],
             "quiet": True, "no_warnings": True,
+            # Chrome cookies fix 403s on YouTube and help with other platforms
+            "cookiesfrombrowser": ("chrome",),
         }
 
-        # TikTok needs specific API host + browser cookies to bypass bot detection
         if platform == "tiktok":
             base_opts.update({
-                "cookiesfrombrowser": ("chrome",),
                 "extractor_args": {
                     "tiktok": {
                         "api_hostname": ["api22-normal-c-useast2a.tiktokv.com"],
@@ -297,7 +297,9 @@ def transcribe():
         return jsonify({"transcript": transcript})
 
     except Exception as e:
-        return jsonify({"error": str(e)})
+        # strip ANSI colour codes from yt-dlp error messages
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+        return jsonify({"error": clean})
 
 
 # ── launch ────────────────────────────────────────────────────────────────────
